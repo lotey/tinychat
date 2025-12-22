@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package proto;
+
+option go_package = "tinychat/proto";
+
+// 消息类型枚举
+enum MessageType {
+  MESSAGE = 0;      // 聊天消息（可包含文字、图片或两者）
+  ONLINE_COUNT = 1; // 在线人数更新
+  SYSTEM = 2;       // 系统消息
+  JOIN = 3;         // 用户加入
+  LEAVE = 4;        // 用户离开
+}
+
+// 聊天消息
+message ChatMessage {
+  MessageType type = 1;        // 消息类型
+  string content = 2;          // 消息内容
+  int32 sender_id = 3;         // 发送者ID
+  string sender_name = 4;      // 发送者名称
+  int32 online_count = 5;      // 在线人数（仅在 ONLINE_COUNT 类型时使用）
+  int64 timestamp = 6;         // 时间戳
+  bytes image_data = 7;        // 图片数据（压缩后）
+  string image_mime = 8;       // 图片MIME类型
+}

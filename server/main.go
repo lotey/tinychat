@@ -1,0 +1,364 @@
+package main
+
+import (
+	"log"
+	"net/http"
+	"sync"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"google.golang.org/protobuf/proto"
+	pb "tinychat/proto"
+)
+
+// Client WebSocket 客户端
+type Client struct {
+	hub         *Hub
+	conn        *websocket.Conn
+	send        chan []byte
+	id          int32
+	name        string
+	lastMsgTime time.Time // 限流: 上次消息时间
+	msgCount    int       // 限流: 当前秒内消息数
+	ip          string    // 客户端 IP
+}
+
+// Hub 管理所有客户端连接
+type Hub struct {
+	clients      map[*Client]bool
+	userCount    map[int32]int    // 每个用户ID的连接数
+	onlineCount  int32            // 在线唯一用户数
+	broadcast    chan []byte
+	register     chan *Client
+	unregister   chan *Client
+	mu           sync.RWMutex
+	ipConnCount  map[string]int   // 每个IP的连接数 (限流)
+}
+
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
+}
+
+// NewHub 创建新的 Hub
+func NewHub() *Hub {
+	return &Hub{
+		broadcast:   make(chan []byte, 256),
+		register:    make(chan *Client),
+		unregister:  make(chan *Client),
+		clients:     make(map[*Client]bool),
+		userCount:   make(map[int32]int),
+		ipConnCount: make(map[string]int),
+	}
+}
+
+// Run Hub 主循环
+func (h *Hub) Run() {
+	for {
+		select {
+		case client := <-h.register:
+			h.mu.Lock()
+			h.clients[client] = true
+			count := len(h.clients)
+			h.mu.Unlock()
+
+			log.Printf("[连接] 新客户端连接, 当前连接数: %d", count)
+			// 不立即广播加入消息，等收到第一条消息后再广播
+
+		case client := <-h.unregister:
+			h.mu.Lock()
+			if _, ok := h.clients[client]; ok {
+				delete(h.clients, client)
+				close(client.send)
+				count := len(h.clients)
+				
+				// 减少 IP 连接计数
+				if client.ip != "" {
+					h.ipConnCount[client.ip]--
+					if h.ipConnCount[client.ip] <= 0 {
+						delete(h.ipConnCount, client.ip)
+					}
+				}
+				h.mu.Unlock()
+
+				// 只有已识别的用户才广播离开消息
+				if client.id != 0 {
+					h.userLeave(client.id)
+					log.Printf("[离开] %s (ID: %d), 当前在线: %d", client.name, client.id, h.onlineCount)
+
+					leaveMsg := &pb.ChatMessage{
+						Type:       pb.MessageType_LEAVE,
+						SenderName: client.name,
+						Content:    client.name + " 离开了聊天室",
+					}
+					h.broadcastProtoMessage(leaveMsg)
+				} else {
+					log.Printf("[断开] 未识别的客户端断开, 当前连接数: %d", count)
+				}
+
+				// 广播在线人数
+				h.broadcastOnlineCount()
+			} else {
+				h.mu.Unlock()
+			}
+
+		case message := <-h.broadcast:
+			h.mu.RLock()
+			var failedClients []*Client
+			for client := range h.clients {
+				select {
+				case client.send <- message:
+				default:
+					// 发送失败，记录需要移除的客户端
+					failedClients = append(failedClients, client)
+				}
+			}
+			h.mu.RUnlock()
+
+			// 在锁外处理失败的客户端，触发 unregister 流程
+			for _, client := range failedClients {
+				h.unregister <- client
+			}
+		}
+	}
+}
+
+// broadcastOnlineCount 广播在线人数
+func (h *Hub) broadcastOnlineCount() {
+	h.mu.RLock()
+	count := h.onlineCount
+	h.mu.RUnlock()
+
+	msg := &pb.ChatMessage{
+		Type:        pb.MessageType_ONLINE_COUNT,
+		OnlineCount: count,
+	}
+	h.broadcastProtoMessage(msg)
+}
+
+// userJoin 用户加入，更新计数
+func (h *Hub) userJoin(id int32) {
+	h.mu.Lock()
+	if h.userCount[id] == 0 {
+		h.onlineCount++
+	}
+	h.userCount[id]++
+	h.mu.Unlock()
+}
+
+// userLeave 用户离开，更新计数
+func (h *Hub) userLeave(id int32) {
+	h.mu.Lock()
+	h.userCount[id]--
+	if h.userCount[id] == 0 {
+		delete(h.userCount, id)
+		h.onlineCount--
+	}
+	h.mu.Unlock()
+}
+
+// broadcastProtoMessage 广播 Protobuf 消息
+func (h *Hub) broadcastProtoMessage(msg *pb.ChatMessage) {
+	data, err := proto.Marshal(msg)
+	if err != nil {
+		log.Printf("Protobuf 编码失败: %v", err)
+		return
+	}
+	h.broadcast <- data
+}
+
+// readPump 读取客户端消息
+func (c *Client) readPump() {
+	defer func() {
+		c.hub.unregister <- c
+		c.conn.Close()
+	}()
+
+	c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	c.conn.SetPongHandler(func(string) error {
+		c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
+
+	for {
+		_, message, err := c.conn.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("WebSocket 错误: %v", err)
+			}
+			break
+		}
+
+		// 限流检查: 每秒最多 5 条消息
+		now := time.Now()
+		if now.Sub(c.lastMsgTime) < time.Second {
+			c.msgCount++
+			if c.msgCount > 5 {
+				log.Printf("[限流] %s (IP: %s) 发送过快, 已丢弃", c.name, c.ip)
+				continue // 丢弃消息
+			}
+		} else {
+			c.msgCount = 1
+			c.lastMsgTime = now
+		}
+
+		// 解析 Protobuf 消息
+		var msg pb.ChatMessage
+		if err := proto.Unmarshal(message, &msg); err != nil {
+			log.Printf("Protobuf 解码失败: %v", err)
+			continue
+		}
+
+		// 提取用户信息（第一次收到消息时）
+		if c.id == 0 && msg.SenderId != 0 {
+			c.id = msg.SenderId
+			c.name = msg.SenderName
+			
+			c.hub.userJoin(c.id)
+			log.Printf("[加入] %s (ID: %d)", c.name, c.id)
+			
+			// 广播加入消息给其他人（不包括自己）
+			joinMsg := &pb.ChatMessage{
+				Type:       pb.MessageType_JOIN,
+				SenderName: c.name,
+				Content:    c.name + " 加入了聊天室",
+			}
+			data, err := proto.Marshal(joinMsg)
+			if err == nil {
+				c.hub.mu.RLock()
+				for client := range c.hub.clients {
+					if client != c {
+						select {
+						case client.send <- data:
+						default:
+						}
+					}
+				}
+				c.hub.mu.RUnlock()
+			}
+			c.hub.broadcastOnlineCount()
+		}
+
+		// 广播聊天消息给其他人（不包括发送者自己）
+		// 过滤掉空消息（握手消息）
+		if msg.Type == pb.MessageType_MESSAGE && msg.Content != "" {
+			c.hub.mu.RLock()
+			for client := range c.hub.clients {
+				if client != c {
+					select {
+					case client.send <- message:
+					default:
+						log.Printf("发送消息失败: %s", client.name)
+					}
+				}
+			}
+			c.hub.mu.RUnlock()
+		}
+	}
+}
+
+// writePump 发送消息到客户端
+func (c *Client) writePump() {
+	ticker := time.NewTicker(54 * time.Second)
+	defer func() {
+		ticker.Stop()
+		c.conn.Close()
+	}()
+
+	for {
+		select {
+		case message, ok := <-c.send:
+			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if !ok {
+				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+
+			// 发送二进制消息
+			if err := c.conn.WriteMessage(websocket.BinaryMessage, message); err != nil {
+				return
+			}
+
+		case <-ticker.C:
+			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		}
+	}
+}
+
+// handleWebSocket 处理 WebSocket 连接
+func handleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
+	// 获取客户端 IP
+	ip := r.Header.Get("X-Forwarded-For")
+	if ip == "" {
+		ip = r.Header.Get("X-Real-IP")
+	}
+	if ip == "" {
+		ip = r.RemoteAddr
+	}
+
+	// IP 连接数限制: 每个 IP 最多 3 个连接
+	hub.mu.Lock()
+	if hub.ipConnCount[ip] >= 3 {
+		hub.mu.Unlock()
+		log.Printf("[限流] IP %s 连接数过多, 拒绝连接", ip)
+		http.Error(w, "Too many connections from this IP", http.StatusTooManyRequests)
+		return
+	}
+	hub.ipConnCount[ip]++
+	hub.mu.Unlock()
+
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Println("WebSocket 升级失败:", err)
+		// 连接失败,减少计数
+		hub.mu.Lock()
+		hub.ipConnCount[ip]--
+		if hub.ipConnCount[ip] <= 0 {
+			delete(hub.ipConnCount, ip)
+		}
+		hub.mu.Unlock()
+		return
+	}
+
+	client := &Client{
+		hub:  hub,
+		conn: conn,
+		send: make(chan []byte, 256),
+		ip:   ip,
+	}
+	client.hub.register <- client
+
+	go client.writePump()
+	go client.readPump()
+}
+
+func main() {
+	hub := NewHub()
+	go hub.Run()
+
+	// WebSocket 路由
+	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		handleWebSocket(hub, w, r)
+	})
+
+	// 静态文件服务
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			http.ServeFile(w, r, "chat.html")
+		} else {
+			http.NotFound(w, r)
+		}
+	})
+
+	addr := ":8080"
+	log.Printf("🚀 TinyChat 服务器启动在 http://localhost%s", addr)
+	if err := http.ListenAndServe(addr, nil); err != nil {
+		log.Fatal("服务器启动失败: ", err)
+	}
+}

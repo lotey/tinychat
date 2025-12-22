@@ -1,0 +1,14 @@
+# Binaries
+*.exe
+server/server
+server/server.exe
+
+# Go
+go.work
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
