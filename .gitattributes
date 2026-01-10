@@ -1,0 +1,9 @@
+# 自动检测文本文件并处理行结尾
+* text=auto
+
+# Shell 脚本强制使用 LF
+*.sh text eol=lf
+
+# Windows 批处理文件使用 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf

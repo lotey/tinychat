@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Protobuf 编译脚本
+# Protobuf 编译脚本（Go + JS）
 
 echo "🔨 编译 Protobuf 文件..."
 
@@ -15,16 +15,28 @@ then
     exit 1
 fi
 
-# 安装 Go protobuf 插件（如果未安装）
-if ! command -v protoc-gen-go &> /dev/null
+# 检查 Node.js 是否安装
+if ! command -v node &> /dev/null
 then
-    echo "📦 安装 protoc-gen-go 插件..."
-    go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+    echo "❌ Node.js 未安装"
+    echo "   安装地址: https://nodejs.org/"
+    exit 1
 fi
 
-# 编译 proto 文件
-protoc --go_out=. --go_opt=paths=source_relative \
-    proto/message.proto
+# 安装插件
+echo "📦 安装插件..."
+go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+npm install -g protobufjs-cli
 
-echo "✅ Protobuf 编译完成！"
-echo "生成文件: proto/message.pb.go"
+# 编译 Go
+echo "📦 生成 Go Protobuf 代码..."
+protoc --go_out=. --go_opt=paths=source_relative proto/message.proto
+echo "✅ Go: proto/message.pb.go"
+
+# 编译 JS
+echo "📦 生成 JS Protobuf 代码..."
+npx pbjs -t static-module -w closure -o proto/message.js proto/message.proto
+echo "✅ JS: proto/message.js"
+
+echo ""
+echo "🎉 Protobuf 编译完成！"

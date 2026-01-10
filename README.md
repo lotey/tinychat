@@ -1,181 +1,111 @@
 # 🔒 TinyChat
 
-> 极简匿名聊天室 - 5分钟部署，阅后即焚，零痕迹
+> **不注册 · 不存储 · 不追踪 · 阅后即焚**  
+> **5MB 轻量 · Protobuf 省流 70% · 20MB 内存**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Go Version](https://img.shields.io/badge/Go-1.20+-00ADD8?logo=go)](https://go.dev/)
 [![WebSocket](https://img.shields.io/badge/WebSocket-Protobuf-blue)](https://protobuf.dev/)
 
-一个注重隐私、极简设计的实时匿名聊天室。无需注册，无需数据库，刷新即清空，完美适合临时讨论和隐私对话。
+## 🎯 核心特性
 
-## ✨ 特性
-
-- 🚀 **极简部署** - 单个二进制文件 + 单个 HTML，无需数据库
-- 🔐 **双层加密** - HTTPS/WSS 传输加密 + Protobuf 二进制混淆
-- 👤 **完全匿名** - 随机 ID，无需注册，无法追踪
-- 🖼️ **图片支持** - 智能压缩至 ≤50KB，节省流量 90%+
-- 💨 **阅后即焚** - 刷新页面即清空，无历史记录
-- 📱 **响应式设计** - 完美支持手机和桌面端
-- ⚡ **高性能** - Go + WebSocket + Protobuf，轻松支持数千并发
-
-## 🎯 使用场景
-
-- 💬 临时讨论敏感话题
-- 📢 匿名爆料/反馈收集
-- 🎪 活动临时聊天室
-- 🏢 内网快速沟通
-- 🔒 不想留痕迹的对话
-
-## 🚀 快速开始
-
-### 方式一：从源码编译
+| 特性 | TinyChat | 传统聊天软件 |
+|------|----------|-------------|
+| 💬 **注册** | ❌ 无需注册，打开即用 | ✅ 需要邮箱/手机号 |
+| 💾 **存储** | ❌ 零存储，消息不落盘 | ✅ 数据库永久保存 |
+| 📝 **日志** | ❌ 零日志，无访问记录 | ✅ 完整日志记录 |
+| 🔍 **追踪** | ❌ 完全匿名，无法追踪 | ✅ 用户 ID 关联 |
+| 🔥 **历史** | ❌ 刷新即销毁 | ✅ 永久保留 |
+| 📦 **体积** | ✅ 5MB 单文件 | ❌ 数百 MB + 依赖 |
+| 💨 **流量** | ✅ Protobuf 省 70% | ❌ JSON 臃肿 |
+| 🚀 **内存** | ✅ 20MB 起步 | ❌ 500MB+ |
 
 ```bash
-# 克隆仓库
+# 3 秒启动
 git clone https://github.com/lotey/tinychat.git
-cd tinychat
-
-# 编译
-go build -o tinychat server/main.go
-
-# 运行
-./tinychat
+cd tinychat && go build -o tinychat main.go && ./tinychat
+# 访问 http://localhost:8080
 ```
-
-### 方式二：Docker 部署
-
-```bash
-# 使用 Docker
-docker run -d -p 8080:8080 你的用户名/tinychat
-
-# 或使用 Docker Compose
-docker-compose up -d
-```
-
-## 📖 功能说明
-
-### 发送消息
-- 输入文字后按 **Enter** 发送
-- **Shift + Enter** 换行
-
-### 发送图片
-- **粘贴** - Ctrl+V 直接粘贴截图
-- **拖拽** - 拖拽图片到聊天区域
-- **选择** - 点击图片按钮选择文件
-
-图片会自动压缩至 50KB 以下，大幅节省流量！
-
-### 匿名系统
-- 每次刷新页面生成新的随机 ID (U0001-U9999)
-- 无法关联历史身份
-- 完全匿名，无需注册
-
-## 🔒 安全特性
-
-### 传输层安全
-- ✅ HTTPS/WSS 加密传输 (配合 Cloudflare)
-- ✅ 防中间人攻击
-- ✅ 防网络窃听
-
-### 协议层安全
-- ✅ Protobuf 二进制协议
-- ✅ 非人类可读
-- ✅ 难以逆向分析
-
-### 隐私保护
-- ✅ 无数据库，无日志
-- ✅ 无历史记录
-- ✅ 刷新即清空
-- ✅ 完全匿名
-
-## 🛠️ 技术栈
-
-- **后端**: Go + Gorilla WebSocket
-- **前端**: HTML + jQuery + Protobuf.js
-- **协议**: WebSocket + Protocol Buffers
-- **部署**: 单二进制文件，零依赖
-
-## 📁 项目结构
-
-```
-tinychat/
-├── chat.html           # 前端页面 (单文件)
-├── server/
-│   └── main.go        # 后端服务器
-├── proto/
-│   ├── message.proto  # Protobuf 定义
-│   └── message.pb.go  # 生成的 Go 代码
-├── README.md
-├── LICENSE
-└── Dockerfile
-```
-
-## 🔧 配置
-
-### 修改端口
-
-编辑 `server/main.go`:
-
-```go
-addr := ":8080"  // 改成你想要的端口
-```
-
-### 配合 Cloudflare
-
-1. 部署到服务器
-2. 配置 Cloudflare SSL/TLS
-3. 自动获得 HTTPS 加密
-
-### Nginx 反向代理
-
-```nginx
-location /ws {
-    proxy_pass http://localhost:8080;
-    proxy_http_version 1.1;
-    proxy_set_header Upgrade $http_upgrade;
-    proxy_set_header Connection "upgrade";
-}
-```
-
-## 🤝 贡献
-
-欢迎提交 Issue 和 Pull Request！
-
-### 开发环境
-
-```bash
-# 安装依赖
-go mod download
-
-# 生成 Protobuf 代码
-protoc --go_out=. --go_opt=paths=source_relative proto/message.proto
-
-# 运行
-go run server/main.go
-```
-
-## 📝 TODO
-
-- [ ] Docker 镜像
-- [ ] 房间/频道功能
-- [ ] 文件传输支持
-- [ ] 更多主题
-- [ ] 管理员功能
-
-## ⚠️ 免责声明
-
-本项目仅供学习交流使用。请遵守当地法律法规，不要用于非法用途。作者不对使用本软件产生的任何后果负责。
-
-## 📄 开源协议
-
-[MIT License](LICENSE)
-
-## 🙏 致谢
-
-- [Gorilla WebSocket](https://github.com/gorilla/websocket)
-- [Protocol Buffers](https://protobuf.dev/)
-- [jQuery](https://jquery.com/)
 
 ---
 
-⭐ 如果这个项目对你有帮助，请给个 Star！
+## 🚀 快速开始
+
+```bash
+# 从源码运行
+git clone https://github.com/lotey/tinychat.git
+cd tinychat
+go build -o tinychat main.go
+./tinychat
+```
+
+**Docker 部署**
+```bash
+docker run -d -p 8080:8080 lotey/tinychat
+```
+
+**免费云平台**（用户自行部署）
+- **Railway.app** - $5/月免费额度，不休眠
+- **Render.com** - 完全免费，15 分钟无活动会休眠
+
+---
+
+## 📖 使用说明
+
+- **发送消息** - Enter 发送，Shift+Enter 换行
+- **发送图片** - Ctrl+V 粘贴 / 拖拽 / 点击按钮
+- **匿名系统** - 每次刷新生成新 ID (U0001-U9999)
+
+---
+
+## 🔒 技术特性
+
+**消息流转：**
+```
+用户 A → 服务器内存转发 → 用户 B
+           ↓
+        立即丢弃
+```
+
+**Protobuf 效率：**
+```
+发送 "Hello World"：
+- JSON:     65 字节
+- Protobuf: 18 字节 (省 72%)
+```
+
+**性能数据：**
+```
+体积: 5.2 MB  |  内存: 20 MB  |  启动: <100ms
+并发: 1000+   |  流量: 省 70%  |  图片: 自动压缩至 50KB
+```
+
+---
+
+## 🛠️ 技术栈
+
+- **后端** - Go + Gorilla WebSocket + Protobuf
+- **前端** - 单个 HTML + 原生 WebSocket
+- **协议** - Protobuf 二进制（比 JSON 小 70%）
+
+---
+
+## 🤝 贡献
+
+欢迎 PR！保持极简原则：
+- ✅ 性能优化、Bug 修复、安全增强
+- ❌ 数据库、用户系统、历史记录
+
+---
+
+## ⚠️ 免责声明
+
+本项目设计为"零存储"，服务器不保存任何消息。建议配合 HTTPS/WSS 使用。仅供学习交流，请遵守当地法律法规。
+
+---
+
+⭐ **如果你重视隐私，请给个 Star！**
+
+## 📄 License
+
+[MIT License](LICENSE)

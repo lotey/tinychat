@@ -46,7 +46,7 @@ var upgrader = websocket.Upgrader{
 // NewHub 创建新的 Hub
 func NewHub() *Hub {
 	return &Hub{
-		broadcast:   make(chan []byte, 256),
+		broadcast:   make(chan []byte, 512),
 		register:    make(chan *Client),
 		unregister:  make(chan *Client),
 		clients:     make(map[*Client]bool),
@@ -84,17 +84,20 @@ func (h *Hub) Run() {
 				}
 				h.mu.Unlock()
 
-				// 只有已识别的用户才广播离开消息
+				// 只有已识别的用户才处理离开逻辑
 				if client.id != 0 {
-					h.userLeave(client.id)
+					isLastConnection := h.userLeave(client.id)
 					log.Printf("[离开] %s (ID: %d), 当前在线: %d", client.name, client.id, h.onlineCount)
 
-					leaveMsg := &pb.ChatMessage{
-						Type:       pb.MessageType_LEAVE,
-						SenderName: client.name,
-						Content:    client.name + " 离开了聊天室",
+					// 只有完全离开才广播（防止多标签页刷屏）
+					if isLastConnection {
+						leaveMsg := &pb.ChatMessage{
+							Type:       pb.MessageType_LEAVE,
+							SenderName: client.name,
+							Content:    client.name + " 离开了聊天室",
+						}
+						h.broadcastProtoMessage(leaveMsg)
 					}
-					h.broadcastProtoMessage(leaveMsg)
 				} else {
 					log.Printf("[断开] 未识别的客户端断开, 当前连接数: %d", count)
 				}
@@ -139,25 +142,29 @@ func (h *Hub) broadcastOnlineCount() {
 	h.broadcastProtoMessage(msg)
 }
 
-// userJoin 用户加入，更新计数
-func (h *Hub) userJoin(id int32) {
+// userJoin 用户加入，返回是否是该用户的首次连接
+func (h *Hub) userJoin(id int32) bool {
 	h.mu.Lock()
-	if h.userCount[id] == 0 {
+	defer h.mu.Unlock()
+	isFirstConnection := h.userCount[id] == 0
+	if isFirstConnection {
 		h.onlineCount++
 	}
 	h.userCount[id]++
-	h.mu.Unlock()
+	return isFirstConnection
 }
 
-// userLeave 用户离开，更新计数
-func (h *Hub) userLeave(id int32) {
+// userLeave 用户离开，返回是否是该用户的最后一个连接
+func (h *Hub) userLeave(id int32) bool {
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.userCount[id]--
-	if h.userCount[id] == 0 {
+	isLastConnection := h.userCount[id] <= 0
+	if isLastConnection {
 		delete(h.userCount, id)
-		h.onlineCount--
+		h.onlineCount = max(h.onlineCount-1, 0)
 	}
-	h.mu.Unlock()
+	return isLastConnection
 }
 
 // broadcastProtoMessage 广播 Protobuf 消息
@@ -177,8 +184,10 @@ func (c *Client) readPump() {
 		c.conn.Close()
 	}()
 
+	c.conn.SetReadLimit(128 * 1024) // 限制单条消息最大 128KB
 	c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 	c.conn.SetPongHandler(func(string) error {
+		// 收到 Pong 时重置超时
 		c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 		return nil
 	})
@@ -191,6 +200,9 @@ func (c *Client) readPump() {
 			}
 			break
 		}
+
+		// 收到任何消息都重置超时（包括心跳）
+		c.conn.SetReadDeadline(time.Now().Add(90 * time.Second))
 
 		// 限流检查: 每秒最多 5 条消息
 		now := time.Now()
@@ -212,39 +224,47 @@ func (c *Client) readPump() {
 			continue
 		}
 
+		// 检查消息大小，防止恶意大包攻击 (限制 60KB)
+		if len(msg.ImageData) > 60*1024 {
+			log.Printf("[安全] %s 发送的图片过大 (%dKB)，已丢弃", c.name, len(msg.ImageData)/1024)
+			continue
+		}
+
 		// 提取用户信息（第一次收到消息时）
 		if c.id == 0 && msg.SenderId != 0 {
 			c.id = msg.SenderId
 			c.name = msg.SenderName
-			
-			c.hub.userJoin(c.id)
+
+			isFirstConnection := c.hub.userJoin(c.id)
 			log.Printf("[加入] %s (ID: %d)", c.name, c.id)
-			
-			// 广播加入消息给其他人（不包括自己）
-			joinMsg := &pb.ChatMessage{
-				Type:       pb.MessageType_JOIN,
-				SenderName: c.name,
-				Content:    c.name + " 加入了聊天室",
-			}
-			data, err := proto.Marshal(joinMsg)
-			if err == nil {
-				c.hub.mu.RLock()
-				for client := range c.hub.clients {
-					if client != c {
-						select {
-						case client.send <- data:
-						default:
+
+			// 只有首次加入才广播（防止多标签页刷屏）
+			if isFirstConnection {
+				joinMsg := &pb.ChatMessage{
+					Type:       pb.MessageType_JOIN,
+					SenderName: c.name,
+					Content:    c.name + " 加入了聊天室",
+				}
+				data, err := proto.Marshal(joinMsg)
+				if err == nil {
+					c.hub.mu.RLock()
+					for client := range c.hub.clients {
+						if client != c {
+							select {
+							case client.send <- data:
+							default:
+							}
 						}
 					}
+					c.hub.mu.RUnlock()
 				}
-				c.hub.mu.RUnlock()
 			}
 			c.hub.broadcastOnlineCount()
 		}
 
 		// 广播聊天消息给其他人（不包括发送者自己）
-		// 过滤掉空消息（握手消息）
-		if msg.Type == pb.MessageType_MESSAGE && msg.Content != "" {
+		// 过滤掉空消息（握手消息），但保留有图片的消息
+		if msg.Type == pb.MessageType_MESSAGE && (msg.Content != "" || len(msg.ImageData) > 0) {
 			c.hub.mu.RLock()
 			for client := range c.hub.clients {
 				if client != c {
@@ -262,7 +282,7 @@ func (c *Client) readPump() {
 
 // writePump 发送消息到客户端
 func (c *Client) writePump() {
-	ticker := time.NewTicker(54 * time.Second)
+	ticker := time.NewTicker(50 * time.Second) // 心跳间隔
 	defer func() {
 		ticker.Stop()
 		c.conn.Close()
@@ -273,16 +293,15 @@ func (c *Client) writePump() {
 		case message, ok := <-c.send:
 			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if !ok {
+				// send 通道已关闭
 				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
-
-			// 发送二进制消息
 			if err := c.conn.WriteMessage(websocket.BinaryMessage, message); err != nil {
 				return
 			}
-
 		case <-ticker.C:
+			// 服务端主动发送 Ping，浏览器自动回复 Pong
 			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
@@ -351,6 +370,9 @@ func main() {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
 			http.ServeFile(w, r, "chat.html")
+		} else if r.URL.Path == "/proto/message.js" {
+			w.Header().Set("Content-Type", "application/javascript")
+			http.ServeFile(w, r, "proto/message.js")
 		} else {
 			http.NotFound(w, r)
 		}
