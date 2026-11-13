@@ -215,8 +215,9 @@
             background: #f9fafb;
             border: 2px solid var(--border-color);
             border-radius: 10px;
-            padding: 10px 14px;
+            padding: 12px 14px;
             font-size: 15px;
+            line-height: 22px;
             outline: none;
             resize: none;
             height: 50px;
@@ -278,6 +279,10 @@
             display: block;
             cursor: pointer;
             object-fit: cover;
+        }
+
+        .chat-text {
+            margin-top: 4px;
         }
 
         /* 图片预览 */
@@ -596,12 +601,16 @@
                 const avatarBg = `linear-gradient(135deg, hsl(${hue}, 65%, 55%), hsl(${hue + 40}, 65%, 45%))`;
 
                 let content = '';
-                if (imageData && imageData.length > 0) {
+                const hasImage = imageData && imageData.length > 0;
+                if (hasImage) {
                     const blob = new Blob([imageData], { type: 'image/jpeg' });
                     const blobUrl = URL.createObjectURL(blob);
                     content += `<img src="${blobUrl}" class="chat-image">`;
                 }
-                if (text) content += (imageData ? '<br>' : '') + $('<div>').text(text).html();
+                if (text) {
+                    const safeText = $('<div>').text(text).html();
+                    content += hasImage ? `<div class="chat-text">${safeText}</div>` : safeText;
+                }
 
                 const msgHtml = `
             <div class="msg-item ${type}">

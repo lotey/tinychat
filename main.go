@@ -25,14 +25,14 @@ type Client struct {
 
 // Hub 管理所有客户端连接
 type Hub struct {
-	clients      map[*Client]bool
-	userCount    map[int32]int    // 每个用户ID的连接数
-	onlineCount  int32            // 在线唯一用户数
-	broadcast    chan []byte
-	register     chan *Client
-	unregister   chan *Client
-	mu           sync.RWMutex
-	ipConnCount  map[string]int   // 每个IP的连接数 (限流)
+	clients     map[*Client]bool
+	userCount   map[int32]int // 每个用户ID的连接数
+	onlineCount int32         // 在线唯一用户数
+	broadcast   chan []byte
+	register    chan *Client
+	unregister  chan *Client
+	mu          sync.RWMutex
+	ipConnCount map[string]int // 每个IP的连接数 (限流)
 }
 
 var upgrader = websocket.Upgrader{
@@ -55,6 +55,28 @@ func NewHub() *Hub {
 	}
 }
 
+// wipeBytes 尽快清零不再需要的消息缓冲区。
+// 这不能控制 Go 垃圾回收时机，但可以避免已完成转发的字节继续保留在可用切片中。
+func wipeBytes(data []byte) {
+	for i := range data {
+		data[i] = 0
+	}
+}
+
+// queueMessage 为每个接收者创建独立副本，避免清理发送方缓冲区时
+// 破坏仍在其他客户端发送队列中的消息。
+func queueMessage(client *Client, data []byte) bool {
+	payload := make([]byte, len(data))
+	copy(payload, data)
+	select {
+	case client.send <- payload:
+		return true
+	default:
+		wipeBytes(payload)
+		return false
+	}
+}
+
 // Run Hub 主循环
 func (h *Hub) Run() {
 	for {
@@ -74,7 +96,7 @@ func (h *Hub) Run() {
 				delete(h.clients, client)
 				close(client.send)
 				count := len(h.clients)
-				
+
 				// 减少 IP 连接计数
 				if client.ip != "" {
 					h.ipConnCount[client.ip]--
@@ -112,14 +134,13 @@ func (h *Hub) Run() {
 			h.mu.RLock()
 			var failedClients []*Client
 			for client := range h.clients {
-				select {
-				case client.send <- message:
-				default:
+				if !queueMessage(client, message) {
 					// 发送失败，记录需要移除的客户端
 					failedClients = append(failedClients, client)
 				}
 			}
 			h.mu.RUnlock()
+			wipeBytes(message)
 
 			// 在锁外处理失败的客户端，触发 unregister 流程
 			for _, client := range failedClients {
@@ -199,79 +220,82 @@ func (c *Client) readPump() {
 		// 收到任何消息都重置超时（包括心跳）
 		c.conn.SetReadDeadline(time.Now().Add(90 * time.Second))
 
-		// 限流检查: 每秒最多 5 条消息
-		now := time.Now()
-		if now.Sub(c.lastMsgTime) < time.Second {
-			c.msgCount++
-			if c.msgCount > 5 {
-				log.Printf("[限流] %s (IP: %s) 发送过快, 已丢弃", c.name, c.ip)
-				continue // 丢弃消息
-			}
-		} else {
-			c.msgCount = 1
-			c.lastMsgTime = now
-		}
+		// 每条消息单独处理，函数退出时清零原始缓冲区和图片字节。
+		func() {
+			var msg pb.ChatMessage
+			defer func() {
+				wipeBytes(message)
+				wipeBytes(msg.ImageData)
+				msg.Reset()
+			}()
 
-		// 解析 Protobuf 消息
-		var msg pb.ChatMessage
-		if err := proto.Unmarshal(message, &msg); err != nil {
-			log.Printf("Protobuf 解码失败: %v", err)
-			continue
-		}
-
-		// 检查消息大小，防止恶意大包攻击 (限制 60KB)
-		if len(msg.ImageData) > 60*1024 {
-			log.Printf("[安全] %s 发送的图片过大 (%dKB)，已丢弃", c.name, len(msg.ImageData)/1024)
-			continue
-		}
-
-		// 提取用户信息（第一次收到消息时）
-		if c.id == 0 && msg.SenderId != 0 {
-			c.id = msg.SenderId
-			c.name = msg.SenderName
-
-			isFirstConnection := c.hub.userJoin(c.id)
-			log.Printf("[加入] %s (ID: %d)", c.name, c.id)
-
-			// 只有首次加入才广播（防止多标签页刷屏）
-			if isFirstConnection {
-				joinMsg := &pb.ChatMessage{
-					Type:       pb.MessageType_JOIN,
-					SenderName: c.name,
-					Content:    c.name + " 加入了聊天室",
+			// 限流检查: 每秒最多 5 条消息
+			now := time.Now()
+			if now.Sub(c.lastMsgTime) < time.Second {
+				c.msgCount++
+				if c.msgCount > 5 {
+					log.Printf("[限流] %s (IP: %s) 发送过快, 已丢弃", c.name, c.ip)
+					return
 				}
-				data, err := proto.Marshal(joinMsg)
-				if err == nil {
-					c.hub.mu.RLock()
-					for client := range c.hub.clients {
-						if client != c {
-							select {
-							case client.send <- data:
-							default:
+			} else {
+				c.msgCount = 1
+				c.lastMsgTime = now
+			}
+
+			// 解析 Protobuf 消息
+			if err := proto.Unmarshal(message, &msg); err != nil {
+				log.Printf("Protobuf 解码失败: %v", err)
+				return
+			}
+
+			// 检查消息大小，防止恶意大包攻击 (限制 60KB)
+			if len(msg.ImageData) > 60*1024 {
+				log.Printf("[安全] %s 发送的图片过大 (%dKB)，已丢弃", c.name, len(msg.ImageData)/1024)
+				return
+			}
+
+			// 提取用户信息（第一次收到消息时）
+			if c.id == 0 && msg.SenderId != 0 {
+				c.id = msg.SenderId
+				c.name = msg.SenderName
+
+				isFirstConnection := c.hub.userJoin(c.id)
+				log.Printf("[加入] %s (ID: %d)", c.name, c.id)
+
+				// 只有首次加入才广播（防止多标签页刷屏）
+				if isFirstConnection {
+					joinMsg := &pb.ChatMessage{
+						Type:       pb.MessageType_JOIN,
+						SenderName: c.name,
+						Content:    c.name + " 加入了聊天室",
+					}
+					data, err := proto.Marshal(joinMsg)
+					if err == nil {
+						c.hub.mu.RLock()
+						for client := range c.hub.clients {
+							if client != c {
+								queueMessage(client, data)
 							}
 						}
+						c.hub.mu.RUnlock()
+						wipeBytes(data)
 					}
-					c.hub.mu.RUnlock()
 				}
+				c.hub.broadcastOnlineCount()
 			}
-			c.hub.broadcastOnlineCount()
-		}
 
-		// 广播聊天消息给其他人（不包括发送者自己）
-		// 过滤掉空消息（握手消息），但保留有图片的消息
-		if msg.Type == pb.MessageType_MESSAGE && (msg.Content != "" || len(msg.ImageData) > 0) {
-			c.hub.mu.RLock()
-			for client := range c.hub.clients {
-				if client != c {
-					select {
-					case client.send <- message:
-					default:
+			// 广播聊天消息给其他人（不包括发送者自己）。
+			// 每个接收者使用独立副本，写入完成后由 writePump 清零。
+			if msg.Type == pb.MessageType_MESSAGE && (msg.Content != "" || len(msg.ImageData) > 0) {
+				c.hub.mu.RLock()
+				for client := range c.hub.clients {
+					if client != c && !queueMessage(client, message) {
 						log.Printf("发送消息失败: %s", client.name)
 					}
 				}
+				c.hub.mu.RUnlock()
 			}
-			c.hub.mu.RUnlock()
-		}
+		}()
 	}
 }
 
@@ -281,7 +305,9 @@ func (c *Client) writePump() {
 
 	for message := range c.send {
 		c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		if err := c.conn.WriteMessage(websocket.BinaryMessage, message); err != nil {
+		err := c.conn.WriteMessage(websocket.BinaryMessage, message)
+		wipeBytes(message)
+		if err != nil {
 			return
 		}
 	}
